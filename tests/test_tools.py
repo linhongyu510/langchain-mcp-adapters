@@ -31,6 +31,7 @@ from langchain_mcp_adapters.interceptors import MCPToolCallRequest, MCPToolCallR
 from langchain_mcp_adapters.tools import (
     MCPToolArtifact,
     _convert_call_tool_result,
+    _MCPToolExecutionError,
     convert_mcp_tool_to_langchain_tool,
     load_mcp_tools,
     to_fastmcp,
@@ -145,6 +146,43 @@ def test_convert_with_structured_content():
     assert artifact == MCPToolArtifact(
         structured_content={"key": "value", "nested": {"data": 123}}
     )
+
+
+def test_convert_error_with_structured_content_carries_artifact():
+    """StructuredContent on an isError=True result is built and carried.
+
+    Regression test for #619: the artifact must be extracted *before* the
+    `isError` branch raises, so the structured error payload survives on the
+    error path with the same parity as a success result.
+    """
+    structured_error = {"code": "RATE_LIMITED", "retry_after": 30}
+    result = CallToolResult(
+        content=[TextContent(type="text", text="rate limited")],
+        isError=True,
+        structuredContent=structured_error,
+    )
+
+    with pytest.raises(_MCPToolExecutionError) as exc_info:
+        _convert_call_tool_result(result)
+
+    error = exc_info.value
+    assert error.tool_content == [
+        {"type": "text", "text": "rate limited", "id": IsLangChainID}
+    ]
+    assert error.artifact == MCPToolArtifact(structured_content=structured_error)
+
+
+def test_convert_error_without_structured_content_has_no_artifact():
+    """An isError=True result with no structuredContent carries a None artifact."""
+    result = CallToolResult(
+        content=[TextContent(type="text", text="boom")],
+        isError=True,
+    )
+
+    with pytest.raises(_MCPToolExecutionError) as exc_info:
+        _convert_call_tool_result(result)
+
+    assert exc_info.value.artifact is None
 
 
 def test_convert_image_content():
@@ -612,6 +650,119 @@ async def test_mcp_tool_success_returns_artifact_through_ainvoke():
     assert isinstance(result, ToolMessage)
     assert result.status == "success"
     assert result.artifact == {"structured_content": {"result": "ok"}}
+
+
+async def test_mcp_tool_error_preserves_structured_content_artifact():
+    """StructuredContent reaches ToolMessage.artifact on the error path.
+
+    Regression test for #619: the structured error payload was dropped because
+    `_convert_call_tool_result` raised before reading `structuredContent`, and
+    LangChain's error path forces `artifact=None`. The error `ToolMessage`
+    must keep `status="error"` and the framework-assigned `tool_call_id` while
+    exposing the structured content as its artifact (success/error parity).
+    """
+    structured_error = {"code": "RATE_LIMITED", "retry_after": 30}
+    session = AsyncMock()
+    session.call_tool.return_value = CallToolResult(
+        content=[TextContent(type="text", text="rate limited")],
+        structuredContent=structured_error,
+        isError=True,
+    )
+    mcp_tool = MCPTool(
+        name="lookup", description="lookup", inputSchema=_TOOL_INPUT_SCHEMA
+    )
+
+    lc_tool = convert_mcp_tool_to_langchain_tool(session, mcp_tool)
+
+    result = await lc_tool.ainvoke(_TOOL_CALL)
+
+    assert isinstance(result, ToolMessage)
+    assert result.status == "error"
+    assert result.tool_call_id == "1"
+    assert result.artifact == {"structured_content": structured_error}
+    assert result.content_blocks == [
+        {"type": "text", "text": "rate limited", "id": IsLangChainID}
+    ]
+
+
+async def test_mcp_tool_error_structured_content_without_text_preserves_artifact():
+    """An error with only structuredContent keeps the artifact.
+
+    Content falls back to the minimal placeholder block since there is no
+    server-provided text to surface to the model.
+    """
+    structured_error = {"code": "RATE_LIMITED", "retry_after": 30}
+    session = AsyncMock()
+    session.call_tool.return_value = CallToolResult(
+        content=[],
+        structuredContent=structured_error,
+        isError=True,
+    )
+    mcp_tool = MCPTool(
+        name="lookup", description="lookup", inputSchema=_TOOL_INPUT_SCHEMA
+    )
+
+    lc_tool = convert_mcp_tool_to_langchain_tool(session, mcp_tool)
+
+    result = await lc_tool.ainvoke(_TOOL_CALL)
+
+    assert isinstance(result, ToolMessage)
+    assert result.status == "error"
+    assert result.tool_call_id == "1"
+    assert result.artifact == {"structured_content": structured_error}
+    assert result.content_blocks == [
+        {"type": "text", "text": _EMPTY_ERROR_MESSAGE, "id": IsLangChainID}
+    ]
+
+
+async def test_mcp_tool_error_without_structured_content_has_no_artifact():
+    """A plain error (no structuredContent) keeps artifact=None (no false attach)."""
+    session = AsyncMock()
+    session.call_tool.return_value = CallToolResult(
+        content=[TextContent(type="text", text="project not found")],
+        isError=True,
+    )
+    mcp_tool = MCPTool(
+        name="lookup", description="lookup", inputSchema=_TOOL_INPUT_SCHEMA
+    )
+
+    lc_tool = convert_mcp_tool_to_langchain_tool(session, mcp_tool)
+
+    result = await lc_tool.ainvoke(_TOOL_CALL)
+
+    assert isinstance(result, ToolMessage)
+    assert result.status == "error"
+    assert result.artifact is None
+
+
+async def test_mcp_tool_error_artifact_matches_success_artifact():
+    """The same structuredContent yields an identical artifact on success/error.
+
+    Success/error parity guard: build two tools backed by the same payload with
+    only `isError` flipped and assert the artifact (and tool_call_id) match.
+    """
+    payload = {"code": "OK", "rows": 3}
+
+    async def _tool_for(is_error: bool) -> ToolMessage:
+        session = AsyncMock()
+        session.call_tool.return_value = CallToolResult(
+            content=[TextContent(type="text", text="done")],
+            structuredContent=payload,
+            isError=is_error,
+        )
+        mcp_tool = MCPTool(
+            name="lookup", description="lookup", inputSchema=_TOOL_INPUT_SCHEMA
+        )
+        lc_tool = convert_mcp_tool_to_langchain_tool(session, mcp_tool)
+        return await lc_tool.ainvoke(_TOOL_CALL)
+
+    success = await _tool_for(False)
+    error = await _tool_for(True)
+
+    assert success.status == "success"
+    assert error.status == "error"
+    assert success.artifact == error.artifact == {"structured_content": payload}
+    assert success.tool_call_id == error.tool_call_id == "1"
 
 
 async def test_mcp_tool_error_raises_with_opt_out_flag():
